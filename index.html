@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2893,5 +2894,187 @@ function runRec() {
 }
 
 </script>
+
+<!-- ===== SHAREPOINT LIVE DATA INTEGRATION ===== -->
+<script>
+  // -----------------------------------------------
+  // CONFIGURATION
+  // -----------------------------------------------
+  const SP_FILE_ID  = "945bac2d-b29f-466d-8356-b42784569e2d";
+  const SP_TENANT   = "silverspaceinc-my";
+  const SP_USER     = "mis_executive_silverspaceinc_com";
+  const SHEET_NAME  = "March 2026";
+
+  // Direct Excel download URL built from your SharePoint embed parameters
+  const SP_URL =
+    `https://${SP_TENANT}.sharepoint.com/personal/${SP_USER}/_layouts/15/Doc.aspx` +
+    `?sourcedoc={${SP_FILE_ID}}&action=embedview&wdAllowInteractivity=False` +
+    `&Item=${encodeURIComponent(SHEET_NAME + "!A1:R500")}&wdHideGridlines=True&wdDownloadButton=True`;
+
+  // SheetJS CDN — reads Excel directly in browser, no server needed
+  const SHEETJS_CDN = "https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js";
+
+  let _sheetJsReady = false;
+
+  function loadSheetJS(cb) {
+    if (_sheetJsReady) { cb(); return; }
+    const s = document.createElement("script");
+    s.src = SHEETJS_CDN;
+    s.onload = () => { _sheetJsReady = true; cb(); };
+    s.onerror = () => { setLiveLabel("SheetJS load failed"); };
+    document.head.appendChild(s);
+  }
+
+  function setLiveLabel(text) {
+    const el = document.getElementById("live-label");
+    if (el) el.textContent = text;
+  }
+
+  // Column name flexible matcher
+  function getCol(row, headers, ...keys) {
+    for (const k of keys) {
+      const h = headers.find(h => h && h.toLowerCase().trim().includes(k.toLowerCase()));
+      if (h && row[h] !== undefined && row[h] !== null && String(row[h]).trim() !== "") {
+        return String(row[h]).trim();
+      }
+    }
+    return "";
+  }
+
+  const BRANCH_NORM = {
+    gurgaon: "Gurgaon", ggr: "Gurgaon",
+    lucknow: "Lucknow", lkn: "Lucknow",
+    ahmedabad: "Ahmedabad", amd: "Ahmedabad", ahm: "Ahmedabad"
+  };
+  const SRC_NORM = {
+    gurgaon: "GGR", ggr: "GGR",
+    lucknow: "LKN", lkn: "LKN",
+    ahmedabad: "AMD", amd: "AMD", ahm: "AMD"
+  };
+
+  function rowToCandidate(row, headers) {
+    const name = getCol(row, headers, "candidate", "name");
+    if (!name || name.length < 2) return null;
+
+    const brRaw = getCol(row, headers, "branch").toLowerCase().trim();
+    const br = BRANCH_NORM[brRaw] || "Gurgaon";
+    const src = SRC_NORM[brRaw] || "GGR";
+
+    return {
+      n:     name,
+      rec:   getCol(row, headers, "recruiter"),
+      tl:    getCol(row, headers, "team lead", "team_lead", "tl", "lead"),
+      st:    getCol(row, headers, "status") || "New",
+      exp:   parseInt(getCol(row, headers, "experience", "exp")) || 0,
+      tech:  getCol(row, headers, "technology", "tech", "role"),
+      visa:  getCol(row, headers, "visa"),
+      ead:   getCol(row, headers, "ead end", "ead expiry", "ead"),
+      expIn: parseInt(getCol(row, headers, "expiring in", "expiry", "days remaining")) || null,
+      vcs:   getCol(row, headers, "vcs"),
+      loc:   getCol(row, headers, "location", "loc"),
+      mkt:   getCol(row, headers, "marketing start", "marketing start date", "mkt"),
+      days:  parseInt(getCol(row, headers, "days")) || 0,
+      br:    br,
+      src:   src,
+    };
+  }
+
+  async function fetchSharePointData() {
+    setLiveLabel("Fetching live data...");
+    try {
+      const resp = await fetch(SP_URL, {
+        credentials: "include",
+        headers: { "Accept": "*/*" }
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const buf = await resp.arrayBuffer();
+
+      loadSheetJS(() => {
+        try {
+          const wb = XLSX.read(buf, { type: "array", cellDates: true });
+
+          // Find best matching sheet
+          const sName = wb.SheetNames.find(s =>
+            s.toLowerCase().includes("march") ||
+            s.toLowerCase().includes("data") ||
+            s.toLowerCase().includes("ggr") ||
+            s.toLowerCase().includes("candidate")
+          ) || wb.SheetNames[0];
+
+          const ws = wb.Sheets[sName];
+          const rawRows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+
+          if (!rawRows.length) {
+            setLiveLabel("No rows found in sheet");
+            return;
+          }
+
+          const headers = Object.keys(rawRows[0]);
+          const candidates = rawRows.map(r => rowToCandidate(r, headers)).filter(Boolean);
+
+          if (!candidates.length) {
+            setLiveLabel("Column mismatch — check Excel headers");
+            return;
+          }
+
+          // Inject live data into BASE_GGR equivalent
+          // We patch the allData() function to use live data instead of BASE_GGR
+          window._LIVE_GGR = candidates;
+
+          const now = new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
+          setLiveLabel("Live · " + now);
+
+          console.log(`✅ SharePoint loaded: ${candidates.length} candidates from sheet "${sName}"`);
+
+          // Re-render dashboard with new data
+          if (typeof refreshAll === "function") refreshAll();
+
+        } catch (e) {
+          console.error("❌ Excel parse error:", e);
+          setLiveLabel("Parse error — check console (F12)");
+        }
+      });
+
+    } catch (err) {
+      console.error("❌ SharePoint fetch error:", err.message);
+      setLiveLabel("Offline · using saved data");
+    }
+  }
+
+  // Patch allData() to use live SharePoint data when available
+  function patchAllData() {
+    if (typeof allData !== "function" || allData._sp_patched) return;
+    const _orig = allData;
+    window.allData = function() {
+      const result = _orig();
+      if (!window._LIVE_GGR || !window._LIVE_GGR.length) return result;
+      // Replace GGR base records with live ones; keep user-added and branch extras
+      const nonBase = result.filter(d => d.src !== "GGR" || d.new || d.placeholder);
+      const live = window._LIVE_GGR.map(d => {
+        // Apply any state overrides (status, reassign, backout) already saved
+        return d;
+      });
+      return [...live, ...nonBase];
+    };
+    window.allData._sp_patched = true;
+    console.log("✅ allData() patched to use SharePoint live data");
+  }
+
+  // Boot sequence: wait for page JS to initialize, then patch + fetch
+  document.addEventListener("DOMContentLoaded", () => {
+    setTimeout(() => {
+      patchAllData();
+      fetchSharePointData();
+    }, 1000);
+
+    // Auto-refresh every 60 seconds — all viewers see live changes
+    setInterval(() => {
+      patchAllData();
+      fetchSharePointData();
+    }, 60000);
+  });
+</script>
+<!-- ===== END SHAREPOINT INTEGRATION ===== -->
+
 </body>
 </html>
